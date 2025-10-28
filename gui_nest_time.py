@@ -1,37 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-GUI COMPLETO - Sistema Automático de Nesting + Preços
-
-Funcionalidades:
-  1) Ler um DXF.
-  2) Executar AUTOMATICAMENTE nesting para:
-     - Inox (chapa configurável, padrão 3000×1240)
-     - Carbono (chapa configurável, padrão 3000×1200)
-  3) Calcular tempos de corte por material/espessura.
-  4) CALCULAR PREÇO UNITÁRIO automaticamente.
-  5) Mostrar TODOS os resultados em uma única tabela.
-
-Aba de Configurações:
-  - Tamanhos de chapas (Inox e Carbono)
-  - Valores das chapas (R$)
-  - Valor do minuto de corte (R$)
-  - Coeficiente de aproveitamento (padrão: 0.95)
-  - Velocidades de corte
-
-FÓRMULA DO PREÇO UNITÁRIO:
-  Preço = (Valor_Chapa / Qtd_Coef) + (Valor_Minuto * Tempo_Corte / Qtd_Max)
-  Onde: Qtd_Coef = Qtd_Max * Coeficiente
+Sistema Automático de Nesting + Preços
+Calcula automaticamente nesting e preços para Inox e Carbono
 """
 
 import json
 import math
 import os
 import re
-import shlex
 import subprocess
 import threading
-from tkinter import Tk, StringVar, IntVar, DoubleVar, N, S, E, W, filedialog, messagebox
+from tkinter import Tk, StringVar, DoubleVar, N, S, E, W, filedialog, messagebox
 from tkinter import ttk
+from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import ezdxf
 from ezdxf.path import make_path
@@ -75,14 +56,12 @@ DEFAULT_CONFIG = {
 }
 
 CONFIG_FILE = "nesting_config.json"
-
-# Regex para extrair "FINAL: N peças"
 FINAL_REGEX = re.compile(r"FINAL:\s*(\d+)\s*pe", re.IGNORECASE)
+SKIP_TYPES = frozenset({"TEXT", "MTEXT", "DIMENSION"})
 
 # -----------------------------
 # Funções auxiliares
 # -----------------------------
-SKIP_TYPES = frozenset({"TEXT", "MTEXT", "DIMENSION"})
 
 def iter_paths(msp):
     for e in msp:
@@ -103,22 +82,42 @@ def length_of_path_flattened(path, tol=0.3):
             total += math.hypot(x2 - x1, y2 - y1)
     return total
 
+def convert_keys_to_float(d):
+    """Converte chaves string para float recursivamente"""
+    if not isinstance(d, dict):
+        return d
+    
+    new_dict = {}
+    for k, v in d.items():
+        try:
+            new_key = float(k)
+        except (ValueError, TypeError):
+            new_key = k
+        
+        if isinstance(v, dict):
+            new_dict[new_key] = convert_keys_to_float(v)
+        else:
+            new_dict[new_key] = v
+    
+    return new_dict
+
 def load_config():
-    """Carrega configurações do arquivo JSON ou retorna padrão"""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
-                # Garantir que sheet_sizes existe (compatibilidade com versões antigas)
                 if "sheet_sizes" not in config:
                     config["sheet_sizes"] = DEFAULT_CONFIG["sheet_sizes"].copy()
+                
+                config["sheet_prices"] = convert_keys_to_float(config.get("sheet_prices", {}))
+                config["cut_speed"] = convert_keys_to_float(config.get("cut_speed", {}))
+                
                 return config
         except:
             pass
-    return json.loads(json.dumps(DEFAULT_CONFIG))  # Deep copy
+    return json.loads(json.dumps(DEFAULT_CONFIG))
 
 def save_config(config):
-    """Salva configurações em arquivo JSON"""
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
@@ -127,37 +126,35 @@ def save_config(config):
         print(f"Erro ao salvar config: {e}")
         return False
 
-# -----------------------------
-# Lógica principal
-# -----------------------------
-def run_nesting_and_get_qty(nest_cmd: str, infile: str, w: float, h: float,
+def run_nesting_and_get_qty(infile: str, w: float, h: float,
                             margin: float = 0.1, tol: float = 0.5, snap: float = 2.0,
-                            out_dir: str = "outputs_nesting", extra_flags=None) -> int:
-    if extra_flags is None:
-        extra_flags = []
-    cmd_parts = list(shlex.split(nest_cmd))
-    cmd_parts += ["--in", infile,
+                            out_dir: str = "outputs_nesting") -> int:
+    cmd_parts = ["python", "nest.py",
+                  "--in", infile,
                   "--w", str(w), "--h", str(h),
                   "--margin", str(margin),
                   "--tol", str(tol),
                   "--snap", str(snap),
                   "--out", out_dir]
-    cmd_parts += list(extra_flags)
+
+    env = os.environ.copy()
+    env['PYTHONIOENCODING'] = 'utf-8'
 
     proc = subprocess.run(
         cmd_parts,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding='utf-8',
+        errors='replace',
+        env=env,
         check=False
     )
     
     if proc.returncode != 0:
         raise RuntimeError(
-            "Nesting retornou erro.\n"
-            f"CMD: {' '.join(cmd_parts)}\n"
-            f"STDOUT:\n{proc.stdout}\n"
-            f"STDERR:\n{proc.stderr}"
+            f"Erro no nesting.\nCMD: {' '.join(cmd_parts)}\n"
+            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         )
 
     full_output = proc.stdout + "\n" + proc.stderr
@@ -165,15 +162,11 @@ def run_nesting_and_get_qty(nest_cmd: str, infile: str, w: float, h: float,
     
     if not m:
         raise RuntimeError(
-            "Não foi possível extrair a quantidade FINAL do nesting.\n"
-            f"Saída (últimas 1000 chars):\n{full_output[-1000:]}"
+            f"Não foi possível extrair a quantidade.\nSaída:\n{full_output[-1000:]}"
         )
     return int(m.group(1))
 
-def compute_length_m(infile: str, tol: float = 0.3, units: str = "mm") -> float:
-    UNIT_FACTORS_TO_M = {"mm": 0.001, "cm": 0.01, "m": 1.0}
-    factor_to_m = UNIT_FACTORS_TO_M[units]
-
+def compute_length_m(infile: str, tol: float = 0.3) -> float:
     doc = ezdxf.readfile(infile)
     msp = doc.modelspace()
 
@@ -181,41 +174,27 @@ def compute_length_m(infile: str, tol: float = 0.3, units: str = "mm") -> float:
     for path in iter_paths(msp):
         total_len_model += length_of_path_flattened(path, tol=tol)
 
-    return total_len_model * factor_to_m
+    return total_len_model * 0.001
 
-def compute_times_and_prices(total_len_m: float, qty: int, config: dict, decimals: int = 3, material_filter: str = None):
-    """
-    Calcula tempos e PREÇOS UNITÁRIOS para todas as combinações material/espessura.
-    
-    Fórmula do preço:
-    Preço = (Valor_Chapa / Qtd_Coef) + (Valor_Minuto * Tempo_Corte / Qtd_Max)
-    Onde: Qtd_Coef = Qtd_Max * Coeficiente
-    
-    Se material_filter for especificado, calcula apenas para aquele material.
-    """
+def compute_times_and_prices(total_len_m: float, qty: int, config: dict, material_filter: str = None):
     rows = []
     sheet_prices = config["sheet_prices"]
     cut_speed = config["cut_speed"]
     minute_price = config["minute_price"]
     coefficient = config["coefficient"]
     
-    qty_coef = qty * coefficient  # Quantidade com coeficiente aplicado
+    qty_coef = qty * coefficient
     
     for material in cut_speed.keys():
-        # Se filtro especificado, pula outros materiais
         if material_filter and material != material_filter:
             continue
             
         for thickness, speed in sorted(cut_speed[material].items()):
-            # Tempo de corte
             per_piece_min = total_len_m / speed if speed > 0 else float("inf")
             total_min = per_piece_min * qty
             
-            # Preço da chapa correspondente
             sheet_price = sheet_prices.get(material, {}).get(thickness, 0.0)
             
-            # CÁLCULO DO PREÇO UNITÁRIO
-            # Preço = (Valor_Chapa / Qtd_Coef) + (Valor_Minuto * Tempo_Corte / Qtd_Max)
             if qty_coef > 0 and qty > 0:
                 price_per_piece = (sheet_price / qty_coef) + (minute_price * total_min / qty)
             else:
@@ -225,9 +204,9 @@ def compute_times_and_prices(total_len_m: float, qty: int, config: dict, decimal
                 "Material": material,
                 "Espessura_mm": thickness,
                 "Velocidade_m_min": speed,
-                "Min_por_peca": round(per_piece_min, decimals),
+                "Min_por_peca": round(per_piece_min, 3),
                 "Quantidade": qty,
-                "Min_total": round(total_min, decimals),
+                "Min_total": round(total_min, 3),
                 "Preco_unitario": round(price_per_piece, 2),
                 "Valor_chapa": sheet_price,
             })
@@ -237,115 +216,289 @@ def compute_times_and_prices(total_len_m: float, qty: int, config: dict, decimal
 # GUI Principal
 # -----------------------------
 class App:
-    def __init__(self, root: Tk):
+    def __init__(self, root: TkinterDnD.Tk):
         self.root = root
-        self.root.title("Sistema de Nesting + Preços - Auto Inox/Carbono")
+        self.root.title("Sistema de Nesting + Preços")
         self.root.geometry("1000x650")
         
-        # Carrega configurações
         self.config = load_config()
+        self.dxf_files = []
         
-        # Variáveis
-        self.var_dxf = StringVar()
-        self.var_nest_cmd = StringVar(value="python nest.py")
-        self.var_status = StringVar(value="Pronto.")
+        # Notebook principal
+        self.main_notebook = ttk.Notebook(root)
+        self.main_notebook.pack(fill="both", expand=True, padx=10, pady=10)
         
-        # Notebook com abas
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
+        # Frame de cálculos
+        self.calc_container = ttk.Frame(self.main_notebook)
+        self.main_notebook.add(self.calc_container, text="Cálculos")
         
-        # Aba 1: Cálculo
-        self.frame_calc = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.frame_calc, text="📊 Cálculo")
+        # Notebook para resultados
+        self.results_notebook = ttk.Notebook(self.calc_container)
+        self.results_notebook.pack(fill="both", expand=True, pady=(0, 10))
         
-        # Aba 2: Configurações
-        self.frame_config = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.frame_config, text="⚙️ Configurações")
+        # Frame de controles
+        self._init_controls()
         
-        # Inicializa abas
-        self._init_calc_tab()
+        # Aba de configurações
+        self.frame_config = ttk.Frame(self.main_notebook, padding=15)
+        self.main_notebook.add(self.frame_config, text="Configurações")
         self._init_config_tab()
+        
+        # Configura drag and drop
+        self._setup_drag_drop()
     
-    def _init_calc_tab(self):
-        """Inicializa aba de cálculo"""
-        frm = self.frame_calc
+    def _init_controls(self):
+        """Inicializa área de controles e status"""
+        control_frame = ttk.Frame(self.calc_container)
+        control_frame.pack(fill="x", padx=10, pady=(10, 0))
         
-        # ===== INPUTS =====
-        input_frame = ttk.LabelFrame(frm, text="Entrada", padding=10)
-        input_frame.grid(row=0, column=0, sticky=(N, S, E, W), pady=(0, 10))
-        frm.columnconfigure(0, weight=1)
+        # Área de drag and drop - EXPANDIDA PARA OCUPAR TODO O ESPAÇO
+        self.drop_frame = ttk.LabelFrame(control_frame, text="📁 Arquivos DXF", padding=20)
+        self.drop_frame.pack(fill="both", expand=True, pady=(0, 10))
         
-        # DXF
-        ttk.Label(input_frame, text="Arquivo DXF:").grid(row=0, column=0, sticky=W, padx=(0,6))
-        ent_dxf = ttk.Entry(input_frame, textvariable=self.var_dxf, width=50)
-        ent_dxf.grid(row=0, column=1, sticky=E+W, padx=6)
-        input_frame.columnconfigure(1, weight=1)
-        ttk.Button(input_frame, text="Procurar…", command=self.choose_dxf).grid(row=0, column=2, padx=(6,0))
+        # Label interno centralizado
+        label_container = ttk.Frame(self.drop_frame)
+        label_container.pack(expand=True)
         
-        # Comando nesting
-        ttk.Label(input_frame, text="Comando:").grid(row=1, column=0, sticky=W, pady=(8,0))
-        ent_cmd = ttk.Entry(input_frame, textvariable=self.var_nest_cmd, width=50)
-        ent_cmd.grid(row=1, column=1, sticky=E+W, padx=6, pady=(8,0))
-        ttk.Label(input_frame, text="ex: python nest.py", foreground="gray").grid(row=1, column=2, sticky=W, pady=(8,0))
+        self.drop_label = ttk.Label(
+            label_container,
+            text="Arraste arquivos DXF aqui ou clique em 'Adicionar'\nSuporta múltiplos arquivos",
+            justify="center",
+            foreground="#666",
+            font=("", 10)
+        )
+        self.drop_label.pack(pady=30)
         
-        # Info sobre chapas
-        info_label = ttk.Label(input_frame, 
-                              text="ℹ️  Sistema calculará automaticamente para Inox (3000×1240) e Carbono (3000×1200)",
-                              foreground="blue", font=("", 9))
-        info_label.grid(row=2, column=0, columnspan=3, sticky=W, pady=(10,0))
+        # Botões
+        btn_frame = ttk.Frame(self.drop_frame)
+        btn_frame.pack(pady=(10, 0))
         
-        # Botão executar
-        btn_frame = ttk.Frame(input_frame)
-        btn_frame.grid(row=3, column=0, columnspan=3, pady=(10,0))
-        self.btn_run = ttk.Button(btn_frame, text="▶ EXECUTAR CÁLCULO", 
-                                  command=self.on_run_clicked, style="Accent.TButton")
-        self.btn_run.pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Adicionar DXF", command=self.add_dxf_files).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Limpar", command=self.clear_files).pack(side="left", padx=5)
+        self.btn_calculate = ttk.Button(btn_frame, text="Calcular Todos", command=self.calculate_all)
+        self.btn_calculate.pack(side="left", padx=5)
+        self.btn_calculate.config(state="disabled")
         
         # Status
-        status_label = ttk.Label(btn_frame, textvariable=self.var_status, foreground="green")
-        status_label.pack(side="left", padx=10)
+        self.var_status = StringVar(value="Aguardando arquivos")
+        ttk.Label(control_frame, textvariable=self.var_status, foreground="#666").pack(pady=5)
+    
+    def _setup_drag_drop(self):
+        """Configura drag and drop - TODA A ÁREA DO FRAME"""
+        self.drop_frame.drop_target_register(DND_FILES)
+        self.drop_frame.dnd_bind('<<Drop>>', self.on_drop)
         
-        # ===== RESULTADOS =====
-        result_frame = ttk.LabelFrame(frm, text="Resultados", padding=10)
-        result_frame.grid(row=1, column=0, sticky=(N, S, E, W))
-        frm.rowconfigure(1, weight=1)
+        self.drop_label.drop_target_register(DND_FILES)
+        self.drop_label.dnd_bind('<<Drop>>', self.on_drop)
+    
+    def on_drop(self, event):
+        """Handler para drag and drop"""
+        files = self.root.tk.splitlist(event.data)
+        dxf_files = [f for f in files if f.lower().endswith('.dxf')]
+        
+        if dxf_files:
+            for file in dxf_files:
+                if file not in self.dxf_files:
+                    self.dxf_files.append(file)
+            
+            self.update_file_list()
+    
+    def add_dxf_files(self):
+        """Adiciona arquivos DXF via dialog"""
+        files = filedialog.askopenfilenames(
+            title="Selecione arquivos DXF",
+            filetypes=[("DXF files", "*.dxf"), ("Todos", "*.*")]
+        )
+        
+        if files:
+            for file in files:
+                if file not in self.dxf_files:
+                    self.dxf_files.append(file)
+            
+            self.update_file_list()
+    
+    def clear_files(self):
+        """Limpa lista de arquivos"""
+        self.dxf_files.clear()
+        
+        # Remove todas as abas de resultados
+        for tab in self.results_notebook.tabs():
+            self.results_notebook.forget(tab)
+        
+        self.update_file_list()
+    
+    def update_file_list(self):
+        """Atualiza exibição da lista de arquivos"""
+        if self.dxf_files:
+            file_names = "\n".join([os.path.basename(f) for f in self.dxf_files])
+            self.drop_label.config(
+                text=f"📄 {len(self.dxf_files)} arquivo(s) carregado(s):\n{file_names}",
+                foreground="#000"
+            )
+            self.btn_calculate.config(state="normal")
+            self.var_status.set(f"{len(self.dxf_files)} arquivo(s) pronto(s) para calcular")
+        else:
+            self.drop_label.config(
+                text="Arraste arquivos DXF aqui ou clique em 'Adicionar'\nSuporta múltiplos arquivos",
+                foreground="#666"
+            )
+            self.btn_calculate.config(state="disabled")
+            self.var_status.set("Aguardando arquivos")
+    
+    def calculate_all(self):
+        """Calcula todos os arquivos carregados"""
+        if not self.dxf_files:
+            return
+        
+        self.btn_calculate.config(state="disabled")
+        self._update_config_from_ui()
+        
+        # Remove abas antigas
+        for tab in self.results_notebook.tabs():
+            self.results_notebook.forget(tab)
+        
+        # Processa cada arquivo em thread
+        threading.Thread(
+            target=self._process_all_files,
+            daemon=True
+        ).start()
+    
+    def _process_all_files(self):
+        """Processa todos os arquivos DXF"""
+        total = len(self.dxf_files)
+        
+        for idx, dxf_file in enumerate(self.dxf_files, 1):
+            file_name = os.path.basename(dxf_file)
+            
+            self.root.after(0, lambda: self.var_status.set(
+                f"Processando {idx}/{total}: {file_name}..."
+            ))
+            
+            try:
+                # Calcula comprimento
+                total_len_m = compute_length_m(dxf_file, tol=0.3)
+                
+                all_rows = []
+                
+                # Processa cada material
+                for material in ["Inox", "Carbono"]:
+                    sheet_size = self.config["sheet_sizes"][material]
+                    w, h = sheet_size["w"], sheet_size["h"]
+                    
+                    qty_material = run_nesting_and_get_qty(
+                        infile=dxf_file,
+                        w=w, h=h,
+                        out_dir=f"outputs_nesting_{material.lower()}_{idx}"
+                    )
+                    
+                    rows = compute_times_and_prices(
+                        total_len_m=total_len_m,
+                        qty=qty_material,
+                        config=self.config,
+                        material_filter=material
+                    )
+                    
+                    all_rows.extend(rows)
+                
+                # Cria aba com resultados
+                self.root.after(0, self._create_result_tab, file_name, all_rows)
+                
+            except Exception as e:
+                error_msg = f"Erro ao processar {file_name}: {str(e)}"
+                self.root.after(0, lambda msg=error_msg: messagebox.showerror("Erro", msg))
+        
+        self.root.after(0, lambda: self.var_status.set(
+            f"✓ Concluído: {total} arquivo(s) processado(s)"
+        ))
+        self.root.after(0, lambda: self.btn_calculate.config(state="normal"))
+    
+    def _create_result_tab(self, file_name, rows):
+        """Cria aba com resultados para um arquivo"""
+        # Frame da aba
+        tab_frame = ttk.Frame(self.results_notebook)
+        self.results_notebook.add(tab_frame, text=file_name[:25])
         
         # Tabela
         cols = ("Material", "Esp(mm)", "Vel(m/min)", "Min/peça", "Qtd", "Min total", "💰 Preço R$")
-        self.tree = ttk.Treeview(result_frame, columns=cols, show="headings", height=18)
+        tree = ttk.Treeview(tab_frame, columns=cols, show="headings", height=20)
         
-        # Configurar colunas
-        col_widths = [90, 70, 85, 75, 60, 80, 100]
+        col_widths = [85, 70, 85, 75, 55, 80, 110]
         for col, width in zip(cols, col_widths):
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=width, anchor="center")
+            tree.heading(col, text=col)
+            tree.column(col, width=width, anchor="center")
         
-        # Destacar coluna de preço
-        self.tree.tag_configure("price", background="#e8f5e9")
+        # Estilo zebra e destaque de preço
+        tree.tag_configure("oddrow", background="#f9f9f9")
+        tree.tag_configure("evenrow", background="#ffffff")
+        tree.tag_configure("price_highlight", foreground="#047857", font=("", 9, "bold"))
         
-        self.tree.grid(row=0, column=0, sticky=(N, S, E, W))
-        result_frame.columnconfigure(0, weight=1)
-        result_frame.rowconfigure(0, weight=1)
+        # Adiciona dados
+        for idx, r in enumerate(rows):
+            tag = "oddrow" if idx % 2 == 0 else "evenrow"
+            values = (
+                r["Material"],
+                f'{r["Espessura_mm"]:.2f}',
+                f'{r["Velocidade_m_min"]:.2f}',
+                f'{r["Min_por_peca"]:.3f}',
+                str(r["Quantidade"]),
+                f'{r["Min_total"]:.3f}',
+                f'R$ {r["Preco_unitario"]:.2f}',
+            )
+            item = tree.insert("", "end", values=values, tags=(tag, "price_highlight"))
+        
+        tree.pack(side="left", fill="both", expand=True)
         
         # Scrollbar
-        vsb = ttk.Scrollbar(result_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscroll=vsb.set)
-        vsb.grid(row=0, column=1, sticky=(N,S))
+        vsb = ttk.Scrollbar(tab_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscroll=vsb.set)
+        vsb.pack(side="right", fill="y")
         
-        # Footer
-        footer = ttk.Label(result_frame, 
-                          text="💡 Preço = (Valor_Chapa/Qtd_Coef) + (R$/min × Tempo_Total/Qtd) | Coef = Qtd × 0.95",
-                          foreground="blue", font=("", 9, "italic"))
-        footer.grid(row=1, column=0, columnspan=2, sticky=W, pady=(5,0))
+        # Bind para copiar preço ao clicar
+        tree.bind('<Button-1>', lambda e: self._on_tree_click(e, tree))
+        
+        # Seleciona a nova aba
+        self.results_notebook.select(tab_frame)
+    
+    def _on_tree_click(self, event, tree):
+        """Handler para clique na tabela - copia preço"""
+        region = tree.identify("region", event.x, event.y)
+        
+        if region == "cell":
+            column = tree.identify_column(event.x)
+            item = tree.identify_row(event.y)
+            
+            # Coluna 7 é a coluna de preço (índice #6)
+            if column == "#7" and item:
+                values = tree.item(item, "values")
+                price_text = values[6]  # "R$ XX.XX"
+                
+                # Extrai apenas o número
+                price_number = price_text.replace("R$", "").strip()
+                
+                # Copia para área de transferência
+                self.root.clipboard_clear()
+                self.root.clipboard_append(price_number)
+                
+                # Feedback visual
+                original_bg = tree.tag_configure("price_highlight", "background")
+                tree.tag_configure("price_highlight", background="#d1fae5")
+                
+                def reset_bg():
+                    tree.tag_configure("price_highlight", background=original_bg[4] if original_bg else "")
+                
+                self.root.after(200, reset_bg)
+                
+                self.var_status.set(f"✓ Preço copiado: {price_number}")
     
     def _init_config_tab(self):
-        """Inicializa aba de configurações"""
-        frm = self.frame_config
-        
-        # Container com scroll
+        """Inicializa aba de configurações - OCUPANDO TODA A ÁREA"""
         from tkinter import Canvas
-        canvas = Canvas(frm)
-        scrollbar = ttk.Scrollbar(frm, orient="vertical", command=canvas.yview)
+        
+        # Canvas com scroll
+        canvas = Canvas(self.frame_config)
+        scrollbar = ttk.Scrollbar(self.frame_config, orient="vertical", command=canvas.yview)
+        
+        # Frame scrollável
         scrollable_frame = ttk.Frame(canvas)
         
         scrollable_frame.bind(
@@ -359,231 +512,98 @@ class App:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
-        # ===== CONFIGURAÇÕES GERAIS =====
-        general_frame = ttk.LabelFrame(scrollable_frame, text="⚙️ Configurações Gerais", padding=15)
-        general_frame.pack(fill="x", padx=10, pady=10)
+        # Frame principal ocupando toda a largura
+        main_frame = ttk.Frame(scrollable_frame)
+        main_frame.pack(fill="both", expand=True, padx=50, pady=30)
         
-        # Valor minuto
-        ttk.Label(general_frame, text="Valor do Minuto de Corte (R$):").grid(row=0, column=0, sticky=W, pady=5)
+        # Configurações gerais
+        general_frame = ttk.LabelFrame(main_frame, text="Configurações Gerais", padding=20)
+        general_frame.pack(fill="x", pady=(0, 15))
+        
+        row = 0
+        ttk.Label(general_frame, text="Valor do Minuto (R$):").grid(row=row, column=0, sticky=W, pady=8, padx=(0, 20))
         self.var_minute_price = DoubleVar(value=self.config["minute_price"])
-        ttk.Entry(general_frame, textvariable=self.var_minute_price, width=15).grid(row=0, column=1, sticky=W, padx=10)
+        ttk.Entry(general_frame, textvariable=self.var_minute_price, width=15).grid(row=row, column=1, sticky=W)
         
-        # Coeficiente
-        ttk.Label(general_frame, text="Coeficiente de Aproveitamento:").grid(row=1, column=0, sticky=W, pady=5)
+        row += 1
+        ttk.Label(general_frame, text="Coeficiente:").grid(row=row, column=0, sticky=W, pady=8, padx=(0, 20))
         self.var_coefficient = DoubleVar(value=self.config["coefficient"])
-        ttk.Entry(general_frame, textvariable=self.var_coefficient, width=15).grid(row=1, column=1, sticky=W, padx=10)
-        ttk.Label(general_frame, text="(padrão: 0.95)", foreground="gray").grid(row=1, column=2, sticky=W)
+        ttk.Entry(general_frame, textvariable=self.var_coefficient, width=15).grid(row=row, column=1, sticky=W)
         
-        # ===== TAMANHOS DAS CHAPAS =====
-        size_frame = ttk.LabelFrame(scrollable_frame, text="📐 Tamanhos das Chapas (mm)", padding=15)
-        size_frame.pack(fill="x", padx=10, pady=10)
+        # Tamanhos das chapas
+        size_frame = ttk.LabelFrame(main_frame, text="Tamanhos das Chapas (mm)", padding=20)
+        size_frame.pack(fill="x", pady=(0, 15))
         
         self.size_vars = {}
         
-        row = 0
-        for material in ["Inox", "Carbono"]:
+        for idx, material in enumerate(["Inox", "Carbono"]):
             self.size_vars[material] = {}
             
-            ttk.Label(size_frame, text=f"{material}:", font=("", 10, "bold")).grid(row=row, column=0, sticky=W, pady=5)
+            ttk.Label(size_frame, text=f"{material}:", font=("", 9, "bold")).grid(
+                row=idx, column=0, sticky=W, pady=8, padx=(0, 20)
+            )
             
-            ttk.Label(size_frame, text="Largura:").grid(row=row, column=1, sticky=W, padx=(20,5))
             w_var = DoubleVar(value=self.config["sheet_sizes"][material]["w"])
             self.size_vars[material]["w"] = w_var
-            ttk.Entry(size_frame, textvariable=w_var, width=10).grid(row=row, column=2, sticky=W)
+            ttk.Entry(size_frame, textvariable=w_var, width=12).grid(row=idx, column=1, padx=(0, 5))
             
-            ttk.Label(size_frame, text="× Altura:").grid(row=row, column=3, sticky=W, padx=(10,5))
+            ttk.Label(size_frame, text="×").grid(row=idx, column=2, padx=5)
+            
             h_var = DoubleVar(value=self.config["sheet_sizes"][material]["h"])
             self.size_vars[material]["h"] = h_var
-            ttk.Entry(size_frame, textvariable=h_var, width=10).grid(row=row, column=4, sticky=W)
-            
-            ttk.Label(size_frame, text="mm", foreground="blue").grid(row=row, column=5, sticky=W, padx=(5,0))
-            
-            row += 1
+            ttk.Entry(size_frame, textvariable=h_var, width=12).grid(row=idx, column=3)
         
-        # ===== PREÇOS DAS CHAPAS =====
+        # Preços e velocidades lado a lado - OCUPANDO TODO O ESPAÇO
+        materials_container = ttk.Frame(main_frame)
+        materials_container.pack(fill="both", expand=True, pady=(0, 15))
+        
         self.price_vars = {}
-        
-        for material in ["Inox", "Carbono"]:
-            price_frame = ttk.LabelFrame(scrollable_frame, text=f"💰 Preços {material}", padding=15)
-            price_frame.pack(fill="x", padx=10, pady=10)
-            
-            self.price_vars[material] = {}
-            
-            row = 0
-            for thickness in sorted(self.config["sheet_prices"][material].keys()):
-                price = self.config["sheet_prices"][material][thickness]
-                
-                ttk.Label(price_frame, text=f"{material} {thickness}mm:").grid(row=row, column=0, sticky=W, pady=5)
-                
-                var = DoubleVar(value=price)
-                self.price_vars[material][thickness] = var
-                
-                entry = ttk.Entry(price_frame, textvariable=var, width=15)
-                entry.grid(row=row, column=1, sticky=W, padx=10)
-                
-                ttk.Label(price_frame, text="R$", foreground="green").grid(row=row, column=2, sticky=W)
-                
-                row += 1
-        
-        # ===== VELOCIDADES DE CORTE =====
         self.speed_vars = {}
         
-        for material in ["Inox", "Carbono"]:
-            speed_frame = ttk.LabelFrame(scrollable_frame, text=f"⚡ Velocidades {material}", padding=15)
-            speed_frame.pack(fill="x", padx=10, pady=10)
+        for col_idx, material in enumerate(["Inox", "Carbono"]):
+            material_frame = ttk.LabelFrame(materials_container, text=material, padding=15)
+            material_frame.grid(row=0, column=col_idx, sticky=(N, S, E, W), padx=5)
             
+            # Cabeçalhos
+            ttk.Label(material_frame, text="Espessura (mm)", font=("", 9, "bold")).grid(row=0, column=0, padx=10, pady=8, sticky=W)
+            ttk.Label(material_frame, text="Preço (R$)", font=("", 9, "bold")).grid(row=0, column=1, padx=10, pady=8, sticky=W)
+            ttk.Label(material_frame, text="Velocidade (m/min)", font=("", 9, "bold")).grid(row=0, column=2, padx=10, pady=8, sticky=W)
+            
+            self.price_vars[material] = {}
             self.speed_vars[material] = {}
             
-            row = 0
-            for thickness in sorted(self.config["cut_speed"][material].keys()):
-                speed = self.config["cut_speed"][material][thickness]
+            for idx, thickness in enumerate(sorted(self.config["sheet_prices"][material].keys()), start=1):
+                ttk.Label(material_frame, text=f"{thickness} mm").grid(row=idx, column=0, sticky=W, padx=10, pady=5)
                 
-                ttk.Label(speed_frame, text=f"{material} {thickness}mm:").grid(row=row, column=0, sticky=W, pady=5)
+                price_var = DoubleVar(value=self.config["sheet_prices"][material][thickness])
+                self.price_vars[material][thickness] = price_var
+                ttk.Entry(material_frame, textvariable=price_var, width=15).grid(row=idx, column=1, padx=10, pady=5, sticky=W)
                 
-                var = DoubleVar(value=speed)
-                self.speed_vars[material][thickness] = var
-                
-                entry = ttk.Entry(speed_frame, textvariable=var, width=15)
-                entry.grid(row=row, column=1, sticky=W, padx=10)
-                
-                ttk.Label(speed_frame, text="m/min", foreground="blue").grid(row=row, column=2, sticky=W)
-                
-                row += 1
-        
-        # ===== BOTÕES =====
-        btn_frame = ttk.Frame(scrollable_frame)
-        btn_frame.pack(fill="x", padx=10, pady=20)
-        
-        ttk.Button(btn_frame, text="💾 Salvar Configurações", 
-                  command=self.save_config_ui).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="🔄 Restaurar Padrões", 
-                  command=self.reset_config_ui).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="📁 Abrir arquivo de config", 
-                  command=self.open_config_file).pack(side="left", padx=5)
-    
-    def choose_dxf(self):
-        path = filedialog.askopenfilename(
-            title="Selecione o DXF",
-            filetypes=[("DXF files","*.dxf"),("Todos","*.*")]
-        )
-        if path:
-            self.var_dxf.set(path)
-    
-    def on_run_clicked(self):
-        dxf = self.var_dxf.get().strip()
-        if not dxf:
-            messagebox.showwarning("Atenção", "Selecione um arquivo DXF.")
-            return
-        
-        nest_cmd = self.var_nest_cmd.get().strip()
-        if not nest_cmd:
-            messagebox.showwarning("Atenção", "Informe o comando do nesting.")
-            return
-        
-        # Atualiza config da UI antes de calcular
-        self._update_config_from_ui()
-        
-        self.btn_run.config(state="disabled")
-        self.var_status.set("🔄 Executando...")
-        
-        threading.Thread(
-            target=self._run_pipeline,
-            args=(dxf, nest_cmd),
-            daemon=True
-        ).start()
-    
-    def _run_pipeline(self, dxf, nest_cmd):
-        try:
-            # Calcula comprimento da peça uma vez
-            self.root.after(0, lambda: self.var_status.set("🔄 Calculando comprimentos..."))
-            total_len_m = compute_length_m(dxf, tol=0.3, units="mm")
+                speed_var = DoubleVar(value=self.config["cut_speed"][material][thickness])
+                self.speed_vars[material][thickness] = speed_var
+                ttk.Entry(material_frame, textvariable=speed_var, width=15).grid(row=idx, column=2, padx=10, pady=5, sticky=W)
             
-            all_rows = []
-            quantities = {}  # Armazena quantidade de cada material
-            
-            # Para cada material (Inox e Carbono)
-            for material in ["Inox", "Carbono"]:
-                # Pega tamanho da chapa deste material
-                sheet_size = self.config["sheet_sizes"][material]
-                w, h = sheet_size["w"], sheet_size["h"]
-                
-                self.root.after(0, lambda m=material, ww=w, hh=h: 
-                              self.var_status.set(f"🔄 Rodando nesting {m} ({int(ww)}×{int(hh)})..."))
-                
-                # Executa nesting
-                qty_material = run_nesting_and_get_qty(
-                    nest_cmd=nest_cmd,
-                    infile=dxf,
-                    w=w, h=h,
-                    margin=0.1,
-                    tol=0.5,
-                    snap=2.0,
-                    out_dir=f"outputs_nesting_{material.lower()}"
-                )
-                
-                quantities[material] = qty_material
-                print(f"DEBUG: {material} → {qty_material} peças (chapa {int(w)}×{int(h)})")
-                
-                # Calcula tempos e preços para este material
-                self.root.after(0, lambda m=material: self.var_status.set(f"🔄 Calculando preços {m}..."))
-                
-                rows = compute_times_and_prices(
-                    total_len_m=total_len_m, 
-                    qty=qty_material,  # USA A QUANTIDADE ESPECÍFICA
-                    config=self.config, 
-                    decimals=3,
-                    material_filter=material
-                )
-                
-                all_rows.extend(rows)
-            
-            print(f"DEBUG: Total de linhas geradas: {len(all_rows)}")
-            for r in all_rows:
-                print(f"  {r['Material']} {r['Espessura_mm']}mm → Qtd: {r['Quantidade']}")
-            
-            # Atualiza UI com todos os resultados
-            self.root.after(0, self._update_results, all_rows, total_len_m)
-            
-        except Exception as e:
-            error_msg = str(e)
-            print(f"ERRO: {error_msg}")
-            import traceback
-            traceback.print_exc()
-            self.root.after(0, lambda: messagebox.showerror("Erro", error_msg))
-            self.root.after(0, lambda: self.var_status.set("❌ Falhou"))
-            self.root.after(0, lambda: self.btn_run.config(state="normal"))
-    
-    def _update_results(self, rows, total_len_m):
-        # Limpa tabela
-        for i in self.tree.get_children():
-            self.tree.delete(i)
+            # Expande as colunas proporcionalmente
+            material_frame.columnconfigure(0, weight=1)
+            material_frame.columnconfigure(1, weight=1)
+            material_frame.columnconfigure(2, weight=1)
         
-        # Adiciona resultados
-        for r in rows:
-            values = (
-                r["Material"],
-                f'{r["Espessura_mm"]:.2f}' if isinstance(r["Espessura_mm"], (int, float)) else str(r["Espessura_mm"]),
-                f'{r["Velocidade_m_min"]:.2f}' if isinstance(r["Velocidade_m_min"], (int, float)) else str(r["Velocidade_m_min"]),
-                f'{r["Min_por_peca"]:.3f}' if isinstance(r["Min_por_peca"], (int, float)) else str(r["Min_por_peca"]),
-                str(r["Quantidade"]),
-                f'{r["Min_total"]:.3f}' if isinstance(r["Min_total"], (int, float)) else str(r["Min_total"]),
-                f'R$ {r["Preco_unitario"]:.2f}' if isinstance(r["Preco_unitario"], (int, float)) else str(r["Preco_unitario"]),
-            )
-            self.tree.insert("", "end", values=values, tags=("price",))
+        # Distribui peso igualmente entre as colunas
+        materials_container.columnconfigure(0, weight=1)
+        materials_container.columnconfigure(1, weight=1)
         
-        self.var_status.set(
-            f"✅ OK | Comprimento/peça: {total_len_m:.5f}m | "
-            f"Inox: {self.config['sheet_sizes']['Inox']['w']:.0f}×{self.config['sheet_sizes']['Inox']['h']:.0f}mm | "
-            f"Carbono: {self.config['sheet_sizes']['Carbono']['w']:.0f}×{self.config['sheet_sizes']['Carbono']['h']:.0f}mm"
-        )
-        self.btn_run.config(state="normal")
+        # Botões centralizados
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(pady=(10, 20))
+        
+        ttk.Button(btn_frame, text="💾 Salvar Configurações", command=self.save_config_ui, width=22).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="🔄 Restaurar Padrões", command=self.reset_config_ui, width=22).pack(side="left", padx=5)
     
     def _update_config_from_ui(self):
         """Atualiza self.config com valores da UI"""
         self.config["minute_price"] = self.var_minute_price.get()
         self.config["coefficient"] = self.var_coefficient.get()
         
-        # Tamanhos de chapa
         for material in self.size_vars:
             self.config["sheet_sizes"][material]["w"] = self.size_vars[material]["w"].get()
             self.config["sheet_sizes"][material]["h"] = self.size_vars[material]["h"].get()
@@ -600,20 +620,18 @@ class App:
         """Salva configurações da UI"""
         self._update_config_from_ui()
         if save_config(self.config):
-            messagebox.showinfo("Sucesso", "Configurações salvas com sucesso!")
+            messagebox.showinfo("Sucesso", "Configurações salvas!")
         else:
-            messagebox.showerror("Erro", "Erro ao salvar configurações.")
+            messagebox.showerror("Erro", "Erro ao salvar.")
     
     def reset_config_ui(self):
         """Restaura configurações padrão"""
-        if messagebox.askyesno("Confirmar", "Restaurar todas as configurações para os valores padrão?"):
-            self.config = json.loads(json.dumps(DEFAULT_CONFIG))  # Deep copy
+        if messagebox.askyesno("Confirmar", "Restaurar configurações padrão?"):
+            self.config = json.loads(json.dumps(DEFAULT_CONFIG))
             
-            # Atualiza UI
             self.var_minute_price.set(self.config["minute_price"])
             self.var_coefficient.set(self.config["coefficient"])
             
-            # Tamanhos de chapa
             for material in self.size_vars:
                 self.size_vars[material]["w"].set(self.config["sheet_sizes"][material]["w"])
                 self.size_vars[material]["h"].set(self.config["sheet_sizes"][material]["h"])
@@ -626,38 +644,14 @@ class App:
                 for thickness, var in self.speed_vars[material].items():
                     var.set(self.config["cut_speed"][material][thickness])
             
-            messagebox.showinfo("Sucesso", "Configurações restauradas para os valores padrão!")
-    
-    def open_config_file(self):
-        """Abre o arquivo de configuração no editor padrão"""
-        if os.path.exists(CONFIG_FILE):
-            try:
-                if os.name == 'nt':  # Windows
-                    os.startfile(CONFIG_FILE)
-                elif os.name == 'posix':  # Linux/Mac
-                    os.system(f'xdg-open "{CONFIG_FILE}"')
-                else:
-                    messagebox.showinfo("Info", f"Arquivo: {os.path.abspath(CONFIG_FILE)}")
-            except:
-                messagebox.showinfo("Info", f"Arquivo: {os.path.abspath(CONFIG_FILE)}")
-        else:
-            messagebox.showwarning("Aviso", "Arquivo de configuração ainda não existe. Salve as configurações primeiro.")
+            messagebox.showinfo("Sucesso", "Configurações restauradas!")
 
 def main():
-    root = Tk()
-    
-    # Estilo
-    try:
-        root.call("tk", "scaling", 1.2)
-    except:
-        pass
+    root = TkinterDnD.Tk()
     
     style = ttk.Style()
     if "clam" in style.theme_names():
         style.theme_use("clam")
-    
-    # Estilo do botão principal
-    style.configure("Accent.TButton", font=("", 10, "bold"))
     
     App(root)
     root.mainloop()
